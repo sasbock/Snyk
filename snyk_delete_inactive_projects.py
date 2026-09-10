@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+DISCLAIMER:
+  This script is provided for demonstration, testing, and educational
+  purposes only. It is NOT intended for production use. Use it at your
+  own risk. The author assumes no responsibility or liability for any
+  damage, data loss, or other consequences resulting from its use.
+
 Delete inactive projects from a Snyk organization in bulk.
 
 Uses the Snyk REST API:
@@ -54,7 +60,7 @@ log = logging.getLogger("snyk-cleanup")
 
 def build_session(token: str) -> requests.Session:
     """Build a session authenticated with the "token" scheme (works for PATs
-    and service account tokens; "Bearer" returned 401 in testing)."""
+    and service account tokens)."""
     session = requests.Session()
     session.headers.update(
         {
