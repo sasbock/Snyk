@@ -13,8 +13,8 @@ Uses the Snyk REST API:
   - DELETE /rest/orgs/{org_id}/projects/{project_id}     (delete a project)
 
 Docs:
-  https://apidocs.snyk.io/?version=2024-10-15#get-/orgs/-org_id-/projects
-  https://apidocs.snyk.io/?version=2024-10-15#delete-/orgs/-org_id-/projects/-project_id-
+  https://apidocs.snyk.io/?version=2026-03-25#get-/orgs/-org_id-/projects
+  https://apidocs.snyk.io/?version=2026-03-25#delete-/orgs/-org_id-/projects/-project_id-
 
 Auth:
   Set SNYK_TOKEN in the environment, or pass --token.
@@ -45,7 +45,7 @@ from typing import Iterator
 
 import requests
 
-API_VERSION = "2024-10-15"
+API_VERSION = "2026-03-25"
 DEFAULT_BASE_URL = "https://api.snyk.io"
 PAGE_LIMIT = 100  # API requires this to be a multiple of 10, minimum 10
 MAX_RETRIES = 5
