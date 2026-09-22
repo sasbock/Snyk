@@ -23,6 +23,16 @@ Provide your Snyk API token either as an environment variable or a flag
 export SNYK_TOKEN=<your-snyk-api-token>
 ```
 
+The Snyk REST API version to call defaults to a pinned date string
+(`2024-10-15` as of this writing). If Snyk deprecates that version before
+this script is updated, override it without a code change via
+`SNYK_API_VERSION`, or per-run via `--api-version` (which takes precedence
+over both):
+
+```bash
+export SNYK_API_VERSION=2025-06-01
+```
+
 ## Running it
 
 Run all commands from the repository root. The entry point is the top-level
@@ -93,9 +103,11 @@ before relying on it as your sole source of CRA compliance evidence:
 - The `--asset` source depends on a Snyk endpoint
   (`/rest/orgs/{org}/inventory/assets`) that is not yet documented as GA at
   https://apidocs.snyk.io — reverify before relying on it long-term.
-- `--api-version` defaults to a pinned date string. Snyk's REST API versions
-  evolve independently of this script, so revisit the default periodically
-  and pass `--api-version` explicitly if you need to pin a specific one.
+- The API version defaults to a pinned date string, still not verified
+  automatically against Snyk's changelog at startup. If Snyk deprecates it,
+  override the effective default via `SNYK_API_VERSION` (or pin one
+  explicitly per run via `--api-version`) rather than waiting on a code
+  change.
 - Rate-limit retry count/backoff are currently fixed, not yet configurable
   via flags.
 - Each run produces a point-in-time snapshot; there is no historical

@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 from typing import Optional, Sequence, Tuple
 
+from .config import API_VERSION_ENV_VAR, DEFAULT_API_VERSION
+
 PROG_NAME = "snyk-generate-cra-sbom-vex"
 
 # Formats the Snyk SBOM API is documented to support (FR-11). SPDX has no
@@ -25,13 +27,6 @@ SBOM_FORMAT_CHOICES: Tuple[str, ...] = (
     "spdx2.3+json",
 )
 DEFAULT_SBOM_FORMAT = "cyclonedx1.6+json"
-
-# Latest known-GA Snyk REST API version at the time this script was
-# written (FR-12). Snyk's REST API versions are dated and evolve
-# independently of this script -- reverify against
-# https://apidocs.snyk.io before relying on this default long-term
-# (see Open Risk #3).
-DEFAULT_API_VERSION = "2024-10-15"
 
 
 def parse_tag(value: str) -> Tuple[str, str]:
@@ -139,11 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     output.add_argument(
         "--api-version",
-        default=DEFAULT_API_VERSION,
+        default=None,
         metavar="DATE",
         help=(
-            f"Snyk REST API version string to call (default: {DEFAULT_API_VERSION}, "
-            "the latest known-GA version as of this script's last update)."
+            "Snyk REST API version string to call. Defaults to the "
+            f"{API_VERSION_ENV_VAR} environment variable if set, else "
+            f"{DEFAULT_API_VERSION} (the latest known-GA version as of this "
+            "script's last update -- see config.resolve_api_version)."
         ),
     )
     output.add_argument(

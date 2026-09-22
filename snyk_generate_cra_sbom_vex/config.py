@@ -17,6 +17,17 @@ from .errors import ConfigError
 
 SPDX_FORMAT_PREFIX = "spdx"
 
+# Latest known-GA Snyk REST API version at the time this script was last
+# updated (FR-12). Snyk's REST API versions are dated and evolve
+# independently of this script -- reverify against
+# https://apidocs.snyk.io before relying on this default long-term (Open
+# Risk #3). SNYK_API_VERSION lets an operator override the effective
+# default without editing source, e.g. once this pinned value is
+# deprecated and before a code change ships; --api-version still wins
+# over both.
+DEFAULT_API_VERSION = "2024-10-15"
+API_VERSION_ENV_VAR = "SNYK_API_VERSION"
+
 
 @dataclass(frozen=True)
 class SourceSelection:
@@ -71,6 +82,12 @@ def resolve_token(args: argparse.Namespace) -> str:
     return token
 
 
+def resolve_api_version(args: argparse.Namespace) -> str:
+    """Resolves the API version: --api-version, then $SNYK_API_VERSION, then the
+    hardcoded default (FR-12, Open Risk #3)."""
+    return args.api_version or os.environ.get(API_VERSION_ENV_VAR) or DEFAULT_API_VERSION
+
+
 def build_config(args: argparse.Namespace) -> RunConfig:
     """Builds a RunConfig from parsed CLI args, raising ConfigError on invalid input."""
     token = resolve_token(args)
@@ -104,7 +121,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         sources=sources,
         token=token,
         sbom_format=args.sbom_format,
-        api_version=args.api_version,
+        api_version=resolve_api_version(args),
         output_prefix=args.output_prefix,
         generate_vex=generate_vex,
         vex_skip_reason=vex_skip_reason,

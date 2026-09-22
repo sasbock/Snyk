@@ -32,7 +32,10 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.org, ["acme-platform"])
         self.assertEqual(args.target, [])
         self.assertEqual(args.sbom_format, cli.DEFAULT_SBOM_FORMAT)
-        self.assertEqual(args.api_version, cli.DEFAULT_API_VERSION)
+        # None here, not cli.DEFAULT_API_VERSION -- resolving --api-version's
+        # actual default (env var, then the hardcoded fallback) is
+        # config.py's job, tested in test_config.py.
+        self.assertIsNone(args.api_version)
         self.assertFalse(args.no_vex)
         self.assertFalse(args.fail_fast)
         self.assertFalse(args.debug)

@@ -8,12 +8,14 @@ from snyk_generate_cra_sbom_vex.errors import ConfigError
 class BuildConfigTests(unittest.TestCase):
     def setUp(self):
         self._env_token = os.environ.pop("SNYK_TOKEN", None)
+        self._env_api_version = os.environ.pop(config.API_VERSION_ENV_VAR, None)
 
     def tearDown(self):
-        if self._env_token is not None:
-            os.environ["SNYK_TOKEN"] = self._env_token
-        else:
-            os.environ.pop("SNYK_TOKEN", None)
+        for var, value in (("SNYK_TOKEN", self._env_token), (config.API_VERSION_ENV_VAR, self._env_api_version)):
+            if value is not None:
+                os.environ[var] = value
+            else:
+                os.environ.pop(var, None)
 
     def test_token_required(self):
         args = cli.parse_args(["--org", "A"])
@@ -65,6 +67,23 @@ class BuildConfigTests(unittest.TestCase):
         self.assertEqual(run_config.sources.orgs, ("A",))
         self.assertEqual(run_config.sources.projects, ("D",))
         self.assertEqual(run_config.sources.count(), 2)
+
+    def test_api_version_defaults_to_hardcoded_default(self):
+        args = cli.parse_args(["--org", "A", "--token", "t"])
+        run_config = config.build_config(args)
+        self.assertEqual(run_config.api_version, config.DEFAULT_API_VERSION)
+
+    def test_api_version_from_env(self):
+        os.environ[config.API_VERSION_ENV_VAR] = "2099-01-01"
+        args = cli.parse_args(["--org", "A", "--token", "t"])
+        run_config = config.build_config(args)
+        self.assertEqual(run_config.api_version, "2099-01-01")
+
+    def test_api_version_flag_takes_precedence_over_env(self):
+        os.environ[config.API_VERSION_ENV_VAR] = "2099-01-01"
+        args = cli.parse_args(["--org", "A", "--token", "t", "--api-version", "2020-01-01"])
+        run_config = config.build_config(args)
+        self.assertEqual(run_config.api_version, "2020-01-01")
 
 
 if __name__ == "__main__":
