@@ -83,11 +83,32 @@ produced for those formats (the run will say so).
 python3 -m unittest discover -s tests -t .
 ```
 
+## Production considerations
+
+This script is intended for production use, but be aware of the following
+before relying on it as your sole source of CRA compliance evidence:
+
+- Merging and VEX derivation only support the default CycloneDX+JSON format
+  (see the limitation noted above).
+- The `--asset` source depends on a Snyk endpoint
+  (`/rest/orgs/{org}/inventory/assets`) that is not yet documented as GA at
+  https://apidocs.snyk.io — reverify before relying on it long-term.
+- `--api-version` defaults to a pinned date string. Snyk's REST API versions
+  evolve independently of this script, so revisit the default periodically
+  and pass `--api-version` explicitly if you need to pin a specific one.
+- Rate-limit retry count/backoff are currently fixed, not yet configurable
+  via flags.
+- Each run produces a point-in-time snapshot; there is no historical
+  diffing between runs.
+
 ## Disclaimer
 
-This script is provided for demonstration, testing, and educational purposes
-only. It is **not** intended for production use. Use it at your own risk.
-The author assumes no responsibility or liability for any damage, data loss,
-or other consequences resulting from its use — including from the Snyk API
-calls it makes, the accuracy of the generated SBOM/VEX documents, or any
-action taken based on their contents.
+This script is intended for production use. It is provided "as is," without
+warranty of any kind, express or implied, including but not limited to
+fitness for a particular purpose. The author assumes no responsibility or
+liability for any damage, data loss, compliance outcome, or other
+consequences resulting from its use — including from the Snyk API calls it
+makes, the accuracy or completeness of the generated SBOM/VEX documents, or
+any action taken based on their contents. Review the generated output and
+validate it against your own organization's compliance requirements before
+relying on it as CRA evidence.
