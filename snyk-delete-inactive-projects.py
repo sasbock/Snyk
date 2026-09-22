@@ -24,16 +24,16 @@ Auth:
 
 Example usage:
   # Preview what would be deleted (no changes made)
-  SNYK_TOKEN=xxxx python3 snyk_delete_inactive_projects.py --org-id <org-id> --dry-run
+  SNYK_TOKEN=xxxx python3 snyk-delete-inactive-projects.py --org-id <org-id> --dry-run
 
   # Actually delete, with one bulk confirmation prompt for all of them
-  SNYK_TOKEN=xxxx python3 snyk_delete_inactive_projects.py --org-id <org-id>
+  SNYK_TOKEN=xxxx python3 snyk-delete-inactive-projects.py --org-id <org-id>
 
   # Confirm each project individually (y/n/a=yes-to-rest/q=stop)
-  SNYK_TOKEN=xxxx python3 snyk_delete_inactive_projects.py --org-id <org-id> --per-project
+  SNYK_TOKEN=xxxx python3 snyk-delete-inactive-projects.py --org-id <org-id> --per-project
 
   # Delete without prompting at all (e.g. for a scheduled cron job)
-  SNYK_TOKEN=xxxx python3 snyk_delete_inactive_projects.py --org-id <org-id> --yes
+  SNYK_TOKEN=xxxx python3 snyk-delete-inactive-projects.py --org-id <org-id> --yes
 """
 
 import argparse
