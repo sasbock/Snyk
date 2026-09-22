@@ -6,9 +6,11 @@ snyk_generate_cra_sbom_vex.cli, and it holds no SBOM/VEX business logic
 of its own -- only logging setup and top-level error-handling/exit-code
 logic (FR-14).
 
-This build implements source resolution/discovery (FR-2, FR-2a, FR-6)
-and prints the resulting project list. SBOM fetch/merge, VEX
-derivation, and file output (FR-7 onward) are not implemented yet.
+This build implements the full pipeline: source resolution/discovery
+(FR-2, FR-2a, FR-6), per-project SBOM fetch (FR-7), merging into one
+aggregate CycloneDX document (FR-8, CycloneDX+JSON only), VEX derivation
+from each project's issue/ignore data (FR-9, CycloneDX+JSON only), and
+writing both to disk (FR-10).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from __future__ import annotations
 import sys
 from typing import List, Optional
 
-from snyk_generate_cra_sbom_vex import cli, config, discovery, logging_setup, reporting
+from snyk_generate_cra_sbom_vex import cli, config, discovery, logging_setup, reporting, sbom, vex, writers
 from snyk_generate_cra_sbom_vex.errors import SnykCraSbomVexError
 from snyk_generate_cra_sbom_vex.snyk_api.client import SnykClient
 
@@ -75,11 +77,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print(reporting.render_projects_table(projects), flush=True)
 
+    try:
+        fetch_results = sbom.fetch_sboms(
+            client, projects, run_config.sbom_format, fail_fast=run_config.fail_fast
+        )
+    except SnykCraSbomVexError as exc:
+        logger.error(str(exc))
+        return exc.exit_code
+
+    ok_count = sum(1 for r in fetch_results if r.ok)
+    fail_count = len(fetch_results) - ok_count
     logger.info(
-        "SBOM fetch/merge, VEX derivation, and file output (FR-7 onward) are not "
-        "implemented yet; this build stops after discovery."
+        "Fetched %d/%d in-scope project SBOM(s) successfully (%d failed, %d skipped as "
+        "out-of-scope).",
+        ok_count,
+        len(fetch_results),
+        fail_count,
+        len(projects) - len(fetch_results),
     )
-    return 0
+    print(reporting.render_sbom_fetch_table(fetch_results), flush=True)
+
+    merge_result = sbom.merge_sboms(fetch_results, run_config.sbom_format)
+    if merge_result.skipped_reason:
+        logger.warning(merge_result.skipped_reason)
+    print(reporting.render_merge_summary(merge_result), flush=True)
+
+    vex_result = vex.derive_vex(client, fetch_results, merge_result, run_config.generate_vex)
+    if vex_result.skipped_reason:
+        logger.warning(vex_result.skipped_reason)
+    print(reporting.render_vex_summary(vex_result), flush=True)
+
+    write_result = writers.write_outputs(merge_result.document, vex_result.document, run_config.output_prefix)
+    print(reporting.render_write_summary(write_result), flush=True)
+
+    return 1 if fail_count else 0
 
 
 if __name__ == "__main__":

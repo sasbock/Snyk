@@ -11,6 +11,12 @@ this client (2026-09-22, api-version 2024-10-15):
         accepts target_id=<id> and tags=<key>:<value> filters -- the tags
         filter resolves Open Risk #6, which flagged this as unconfirmed)
   - GET /rest/orgs/{org}/projects/{project}                     (get)
+  - GET /rest/orgs/{org}/projects/{project}/sbom                 (get; ?format=
+        is required -- confirmed the literal "+" in a value like
+        "cyclonedx1.6+json" must be percent-encoded as %2B, since an
+        unencoded "+" in a query string decodes as a space and fails the
+        API's enum validation. Response is the raw SBOM document itself,
+        not a JSON:API envelope)
   - GET /rest/groups/{group}/orgs                                (list, paginated)
   - GET /rest/orgs/{org}/targets                                 (list, paginated)
   - GET /rest/orgs/{org}/targets/{target}                        (get)
@@ -22,6 +28,21 @@ The asset endpoints resolve Open Risk #1, which could not confirm a
 stable endpoint at spec-writing time -- they are not yet documented as
 GA at https://apidocs.snyk.io as of this writing, so re-verify before
 relying on them long-term.
+
+  - GET /rest/orgs/{org}/issues?scan_item.id=&scan_item.type=project
+                                                                  (list, paginated)
+  - GET /v1/org/{org}/project/{project}/ignores                  (get; legacy
+        v1 API, not JSON:API -- no envelope, no ?version=)
+Confirmed against the live OpenAPI spec at
+https://api.snyk.io/rest/openapi/{api-version} while building FR-9
+(Open Risk #2): the REST issues endpoint's `attributes.ignored` is only
+a boolean, and its `relationships.ignore` is an opaque
+{id, type: "ignore"} reference with no path in this API version to
+fetch the ignore's actual reason/justification/expiry. That detail is
+only available from the legacy v1 ignores endpoint, keyed by issue ID,
+in the reasonType/reason/expires shape FR-3's mapping table is written
+against -- so issues and ignore reasons are deliberately read from two
+different API generations.
 
 A 404 on a "get" or first-page "list" call is treated as "not found"
 and surfaces as None to the caller, which lets resolvers try the next
@@ -110,18 +131,23 @@ class SnykClient:
         qs = urllib.parse.urlencode(query)
         return f"{self._base_url}{path}?{qs}" if qs else f"{self._base_url}{path}"
 
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """GETs one page. Returns the parsed body, or None on HTTP 404."""
-        url = self._build_url(path, params)
+    def _send_get(self, url: str, headers: Dict[str, str], error_path: str) -> Optional[bytes]:
+        """GETs one URL and returns the raw response body, or None on HTTP 404.
+
+        Shared by every other GET method here (JSON:API and legacy v1
+        alike) so retry/backoff (FR-15) and error mapping live in one
+        place. `error_path` is only used for error messages -- it need
+        not match `url` exactly (e.g. it can be the unversioned path).
+        """
         attempt = 0
         while True:
-            request = urllib.request.Request(url, method="GET", headers=self._headers())
+            request = urllib.request.Request(url, method="GET", headers=headers)
             logger.debug("GET %s", url)
             try:
                 with urllib.request.urlopen(request, timeout=self._timeout) as response:
                     body = response.read()
                     logger.debug("-> HTTP %s", response.status)
-                    return json.loads(body) if body else {}
+                    return body
             except urllib.error.HTTPError as exc:
                 body = exc.read()
                 detail = _error_detail(body)
@@ -139,11 +165,11 @@ class SnykClient:
                     continue
                 if exc.code == 401:
                     raise AuthenticationError(
-                        f"Snyk API rejected the supplied token (GET {path}): {detail}"
+                        f"Snyk API rejected the supplied token (GET {error_path}): {detail}"
                     )
                 if exc.code == 404:
                     return None
-                raise SnykApiError(exc.code, detail, "GET", path)
+                raise SnykApiError(exc.code, detail, "GET", error_path)
             except urllib.error.URLError as exc:
                 if attempt < self._retry_policy.max_retries:
                     delay = self._retry_policy.delay_seconds(attempt)
@@ -151,7 +177,34 @@ class SnykClient:
                     time.sleep(delay)
                     attempt += 1
                     continue
-                raise SnykApiError(0, str(exc), "GET", path) from exc
+                raise SnykApiError(0, str(exc), "GET", error_path) from exc
+
+    def _request_bytes(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
+        """GETs one REST API URL and returns the raw response body, or None on HTTP 404.
+
+        Used both by _get (which parses the body as JSON:API) and
+        get_project_sbom (whose response is a raw CycloneDX/SPDX document,
+        not a JSON:API envelope, and may not even be JSON for an XML
+        --sbom-format).
+        """
+        return self._send_get(self._build_url(path, params), self._headers(), path)
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """GETs one page as JSON:API. Returns the parsed body, or None on HTTP 404."""
+        body = self._request_bytes(path, params)
+        if body is None:
+            return None
+        return json.loads(body) if body else {}
+
+    def _v1_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"token {self._token}", "Content-Type": "application/json"}
+
+    def _get_v1(self, path: str) -> Optional[Dict[str, Any]]:
+        """GETs a legacy v1 API path: no ?version=, no JSON:API envelope."""
+        body = self._send_get(f"{self._base_url}{path}", self._v1_headers(), path)
+        if body is None:
+            return None
+        return json.loads(body) if body else {}
 
     def _get_resource(self, path: str) -> Optional[Dict[str, Any]]:
         """GETs a single-resource endpoint and unwraps its top-level `data` object.
@@ -211,6 +264,19 @@ class SnykClient:
     def get_project(self, org_id: str, project_id: str) -> Optional[Dict[str, Any]]:
         return self._get_resource(f"/rest/orgs/{org_id}/projects/{project_id}")
 
+    def get_project_sbom(self, org_id: str, project_id: str, sbom_format: str) -> Optional[bytes]:
+        """Fetches one project's SBOM document (FR-7).
+
+        Returns the raw response bytes -- the document is CycloneDX or
+        SPDX, not a JSON:API resource, and may be XML rather than JSON
+        depending on sbom_format -- or None on HTTP 404 (e.g. a project
+        type the SBOM API doesn't actually support despite looking
+        in-scope).
+        """
+        return self._request_bytes(
+            f"/rest/orgs/{org_id}/projects/{project_id}/sbom", {"format": sbom_format}
+        )
+
     # -- targets ------------------------------------------------------------
 
     def list_org_targets(self, org_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -226,3 +292,20 @@ class SnykClient:
 
     def list_asset_projects(self, org_id: str, asset_id: str) -> Optional[List[Dict[str, Any]]]:
         return self._paginate(f"/rest/orgs/{org_id}/inventory/assets/{asset_id}/relationships/projects")
+
+    # -- issues / ignores (FR-9) ---------------------------------------------
+
+    def list_project_issues(self, org_id: str, project_id: str) -> List[Dict[str, Any]]:
+        """A project's current issues (FR-9). Never 404s for a project that exists."""
+        params = {"scan_item.id": project_id, "scan_item.type": "project"}
+        return self._paginate(f"/rest/orgs/{org_id}/issues", params) or []
+
+    def get_project_ignores(self, org_id: str, project_id: str) -> Dict[str, Any]:
+        """A project's ignore reasons, keyed by issue ID (FR-9, Open Risk #2).
+
+        Legacy v1 API: {issue_id: [{path_or_"*": {reason, reasonType,
+        expires, created, ignoredBy, ...}}, ...]}. Returns {} both when
+        the project has no ignores and on 404, since an absent ignore
+        list is a normal, not an error, state.
+        """
+        return self._get_v1(f"/v1/org/{org_id}/project/{project_id}/ignores") or {}

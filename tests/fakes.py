@@ -26,6 +26,10 @@ class FakeSnykClient:
         project_tags: Optional[Dict[Tuple[str, str], List[Tuple[str, str]]]] = None,
         org_assets: Optional[Dict[str, List[str]]] = None,
         asset_projects: Optional[Dict[Tuple[str, str], List[str]]] = None,
+        sboms: Optional[Dict[Tuple[str, str], bytes]] = None,
+        sbom_errors: Optional[Dict[Tuple[str, str], Exception]] = None,
+        project_issues: Optional[Dict[Tuple[str, str], List[Dict[str, Any]]]] = None,
+        project_ignores: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
     ) -> None:
         self.orgs = orgs or []
         self.group_orgs = group_orgs or {}
@@ -38,6 +42,15 @@ class FakeSnykClient:
         self.org_assets = org_assets or {}
         # (org_id, asset_id) -> [project_id, ...]
         self.asset_projects = asset_projects or {}
+        # (org_id, project_id) -> raw SBOM document bytes
+        self.sboms = sboms or {}
+        # (org_id, project_id) -> Exception to raise instead of returning
+        self.sbom_errors = sbom_errors or {}
+        self.sbom_fetch_calls: List[Tuple[str, str, str]] = []
+        # (org_id, project_id) -> list of REST issue resources
+        self.project_issues = project_issues or {}
+        # (org_id, project_id) -> legacy v1 ignores map {issue_key: [...]}
+        self.project_ignores = project_ignores or {}
 
     def list_orgs(self) -> List[Dict[str, Any]]:
         return [{"id": org_id} for org_id in self.orgs]
@@ -93,3 +106,50 @@ class FakeSnykClient:
         if project_ids is None:
             return None
         return [{"id": pid} for pid in project_ids]
+
+    def get_project_sbom(self, org_id: str, project_id: str, sbom_format: str) -> Optional[bytes]:
+        self.sbom_fetch_calls.append((org_id, project_id, sbom_format))
+        error = self.sbom_errors.get((org_id, project_id))
+        if error is not None:
+            raise error
+        return self.sboms.get((org_id, project_id))
+
+    def list_project_issues(self, org_id: str, project_id: str) -> List[Dict[str, Any]]:
+        return self.project_issues.get((org_id, project_id), [])
+
+    def get_project_ignores(self, org_id: str, project_id: str) -> Dict[str, Any]:
+        return self.project_ignores.get((org_id, project_id), {})
+
+
+def issue(
+    issue_id: str,
+    key: str,
+    package_name: str,
+    package_version: str,
+    issue_type: str = "package_vulnerability",
+    cve: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Builds an issue resource shaped like the real REST API's."""
+    problems = [{"id": key, "source": "SNYK", "type": "vulnerability"}]
+    if cve:
+        problems.insert(0, {"id": cve, "source": "NVD", "type": "vulnerability"})
+    return {
+        "id": issue_id,
+        "type": "issue",
+        "attributes": {
+            "key": key,
+            "type": issue_type,
+            "problems": problems,
+            "coordinates": [
+                {"representations": [{"dependency": {"package_name": package_name, "package_version": package_version}}]}
+            ],
+        },
+    }
+
+
+def ignore_entry(reason_type: str, reason: str = "", expires: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Builds the legacy v1 ignores value for one issue key: [{path: details}]."""
+    details = {"reasonType": reason_type, "reason": reason}
+    if expires:
+        details["expires"] = expires
+    return [{"*": details}]

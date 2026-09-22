@@ -66,6 +66,43 @@ class ClientPaginationTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class ClientSbomTests(unittest.TestCase):
+    def test_returns_raw_bytes_and_encodes_format_plus(self):
+        raw = b'{"bomFormat": "CycloneDX", "components": []}'
+
+        class _RawResp:
+            status = 200
+
+            def read(self):
+                return raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        client = SnykClient(token="t", api_version="2024-10-15")
+        with patch("urllib.request.urlopen", return_value=_RawResp()) as mock_urlopen:
+            result = client.get_project_sbom("o1", "p1", "cyclonedx1.6+json")
+
+        self.assertEqual(result, raw)
+        called_url = mock_urlopen.call_args[0][0].full_url
+        # A literal "+" must be percent-encoded (%2B), not left as "+" (which
+        # decodes as a space and fails the API's format enum validation --
+        # confirmed against a live tenant while building this client).
+        self.assertIn("format=cyclonedx1.6%2Bjson", called_url)
+
+    def test_404_returns_none(self):
+        client = SnykClient(token="t", api_version="2024-10-15")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=_http_error(404, {"errors": [{"detail": "not found"}]}),
+        ):
+            result = client.get_project_sbom("o1", "missing", "cyclonedx1.6+json")
+        self.assertIsNone(result)
+
+
 class ClientErrorHandlingTests(unittest.TestCase):
     def test_401_raises_authentication_error(self):
         client = SnykClient(token="bad", api_version="2024-10-15")

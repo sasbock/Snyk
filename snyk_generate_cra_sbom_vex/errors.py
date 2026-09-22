@@ -36,3 +36,9 @@ class NoProjectsDiscoveredError(SnykCraSbomVexError):
     """The union of all resolved sources contained zero in-scope projects."""
 
     exit_code = 5
+
+
+class ProjectFetchError(SnykCraSbomVexError):
+    """A single project's SBOM/issues fetch failed and --fail-fast is set (FR-14)."""
+
+    exit_code = 6
