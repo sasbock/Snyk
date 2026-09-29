@@ -1,4 +1,4 @@
-"""Fetches (FR-7) and merges (FR-8) per-project SBOM documents.
+"""Fetches (FR-7) and aggregates (FR-8) per-project SBOM documents.
 
 Per FR-1, only projects classified in-scope (Open Source/Container --
 see resolvers/base.py) are fetched; others are skipped and logged in
@@ -6,15 +6,21 @@ debug mode rather than attempted. Per FR-14, a single project's fetch
 failure is reported and the run continues by default; --fail-fast
 aborts the whole run on the first one instead.
 
-Merging (merge_sboms) is implemented for CycloneDX+JSON only -- the
+Aggregation (merge_sboms) is implemented for CycloneDX+JSON only -- the
 format FR-7/FR-8 describe concretely. XML and SPDX SBOMs are still
-fetched, but merging them is out of scope for now (each has a
+fetched, but aggregating them is out of scope for now (each has a
 meaningfully different merge story: XML needs its own parser, and SPDX
 uses packages/relationships rather than components/dependencies) and is
 reported back as a skip reason rather than attempted.
 
-VEX derivation (FR-9) and writing output files (FR-10) are still not
-implemented.
+Per v0.6 of the requirements doc, aggregation no longer de-duplicates
+components by purl (FR-8): every component occurrence from every
+fetched SBOM is kept, each with its own unique bom-ref, so the same
+library appearing in more than one project -- or more than once within
+a single project -- appears that many times in the output. VEX
+de-duplication of vulnerabilities *across* those occurrences (FR-9a) is
+vex.py's job, using component_lookup below to find every occurrence a
+given project-scoped (name, version) maps to.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -121,33 +127,34 @@ def fetch_sboms(
     return results
 
 
-# -- merge (FR-8) -----------------------------------------------------------
+# -- aggregate (FR-8) ---------------------------------------------------------
 
 _CYCLONEDX_JSON_FORMAT_RE = re.compile(r"^cyclonedx(?P<spec_version>\d+\.\d+)\+json$")
-_UNION_LIST_FIELDS = ("licenses", "hashes", "externalReferences")
 
 
 @dataclass(frozen=True)
 class MergeResult:
     document: Optional[Dict[str, Any]]
-    component_count: int
-    raw_component_count: int  # sum across sources, before purl-level de-duplication
+    component_count: int  # every occurrence kept -- no purl-level de-duplication (FR-8)
     dependency_count: int
-    # (org_id, project_id, package_name, package_version) -> canonical ref in
-    # `document`, so vex.py can point a project's issues at the right merged
-    # component without re-deriving _dedup_key itself.
-    component_lookup: Dict[Tuple[str, str, str, str], str]
+    # (org_id, project_id, package_name, package_version) -> every occurrence's
+    # bom-ref within that project (usually one, but FR-8 allows a package to
+    # appear more than once within a single project too), so vex.py can find
+    # every affected occurrence for FR-9a's affects array without re-deriving
+    # _component_identity itself.
+    component_lookup: Dict[Tuple[str, str, str, str], List[str]] = field(default_factory=dict)
     skipped_reason: Optional[str] = None
 
 
-def _dedup_key(component: Dict[str, Any]) -> str:
-    """The identity a component is merged on: its purl, or a structural fallback.
+def _component_identity(component: Dict[str, Any]) -> str:
+    """The identity used to build a readable bom-ref: a component's purl, or a
+    structural fallback.
 
     Not every component carries a purl -- a Container project's root
     `metadata.component` (the scanned image itself) typically doesn't --
-    so those fall back to (type, group, name, version), which still lets
-    identical images/components pulled in by different projects collapse
-    into one entry.
+    so those fall back to (type, group, name, version). This is no
+    longer a de-duplication key (FR-8 keeps every occurrence); it only
+    makes each occurrence's bom-ref traceable back to what it is.
     """
     purl = component.get("purl")
     if purl:
@@ -161,68 +168,29 @@ def _dedup_key(component: Dict[str, Any]) -> str:
     return "no-purl:" + "|".join(parts)
 
 
-def _dedup_json_list(items: List[Any]) -> List[Any]:
-    seen: Set[str] = set()
-    result: List[Any] = []
-    for item in items:
-        key = json.dumps(item, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
-    return result
-
-
-def _merge_component_into(
-    store: Dict[str, Dict[str, Any]], canonical_ref: str, component: Dict[str, Any], project: ResolvedProject
-) -> None:
-    """Adds/merges one source component into the aggregate, under its canonical ref.
-
-    FR-8: identical components collapse into one entry with merged
-    properties noting every contributing project, and merged
-    licenses/hashes/externalReferences rather than only the first seen.
-    A `snyk:sourceProjectId` property is what makes each component
-    traceable back to its originating project (NFR-1).
-    """
-    provenance = {"name": "snyk:sourceProjectId", "value": f"{project.org_id}/{project.project_id}"}
-    existing = store.get(canonical_ref)
-
-    if existing is None:
-        merged = copy.deepcopy(component)
-        merged["bom-ref"] = canonical_ref
-        merged["properties"] = list(merged.get("properties", [])) + [provenance]
-        store[canonical_ref] = merged
-        return
-
-    for field_name in _UNION_LIST_FIELDS:
-        if field_name in component:
-            existing[field_name] = _dedup_json_list(existing.get(field_name, []) + component[field_name])
-
-    properties = existing.setdefault("properties", [])
-    if provenance not in properties:
-        properties.append(provenance)
-
-
 def merge_sboms(fetch_results: List[SbomFetchResult], sbom_format: str) -> MergeResult:
-    """Merges every successfully fetched SBOM into one aggregate CycloneDX document.
+    """Aggregates every successfully fetched SBOM into one CycloneDX document.
 
-    Components are de-duplicated by _dedup_key (FR-8); the dependency
-    graph is rebuilt on top of that same de-duplication, since each
-    source document's bom-refs are only locally unique (two projects can
-    both label their nth component "n-<name>@<version>", which would
-    silently corrupt the merged edges if left unmapped) -- so bom-refs
-    are remapped to the canonical ref before edges are unioned.
+    Per FR-8, components are *not* de-duplicated: every occurrence from
+    every source document is kept, each assigned its own unique bom-ref
+    (identity + source project + an incrementing per-project occurrence
+    count, so even the same component appearing twice within one
+    project's own SBOM gets two distinct refs). The dependency graph is
+    rebuilt on top of that same remapping, since each source document's
+    bom-refs are only locally unique (two projects can both label their
+    nth component "n-<name>@<version>", which would silently corrupt the
+    aggregate edges if left unmapped).
     """
     format_match = _CYCLONEDX_JSON_FORMAT_RE.match(sbom_format)
     if format_match is None:
         return MergeResult(
             document=None,
             component_count=0,
-            raw_component_count=0,
             dependency_count=0,
             component_lookup={},
             skipped_reason=(
-                f"merging is only implemented for CycloneDX+JSON formats; the "
-                f"{sbom_format} SBOMs already fetched were not merged (FR-8)."
+                f"aggregation is only implemented for CycloneDX+JSON formats; the "
+                f"{sbom_format} SBOMs already fetched were not aggregated (FR-8)."
             ),
         )
 
@@ -231,55 +199,70 @@ def merge_sboms(fetch_results: List[SbomFetchResult], sbom_format: str) -> Merge
         return MergeResult(
             document=None,
             component_count=0,
-            raw_component_count=0,
             dependency_count=0,
             component_lookup={},
-            skipped_reason="no successfully fetched SBOMs to merge",
+            skipped_reason="no successfully fetched SBOMs to aggregate",
         )
 
-    merged_components: Dict[str, Dict[str, Any]] = {}
-    merged_edges: Dict[str, Set[str]] = defaultdict(set)
-    component_lookup: Dict[Tuple[str, str, str, str], str] = {}
-    raw_component_count = 0
+    components: List[Dict[str, Any]] = []
+    dependency_edges: Dict[str, Set[str]] = defaultdict(set)
+    component_lookup: Dict[Tuple[str, str, str, str], List[str]] = defaultdict(list)
 
     for result in successful:
         try:
             source_doc = json.loads(result.document)
         except ValueError:
             logger.warning(
-                "could not parse SBOM for %s/%s as JSON; excluded from merge",
+                "could not parse SBOM for %s/%s as JSON; excluded from aggregate",
                 result.project.org_id,
                 result.project.project_id,
             )
             continue
 
+        project = result.project
         local_components = list(source_doc.get("components") or [])
         root_component = (source_doc.get("metadata") or {}).get("component")
         if root_component:
             local_components = [root_component] + local_components
-        raw_component_count += len(local_components)
 
         local_ref_map: Dict[str, str] = {}
+        occurrence_counts: Dict[str, int] = defaultdict(int)
+
         for component in local_components:
-            canonical_ref = _dedup_key(component)
+            identity = _component_identity(component)
+            occurrence_counts[identity] += 1
+            # Unique per occurrence (FR-8): identity, plus the source project,
+            # plus this project's own running count for that identity, so
+            # duplicates within a single project's SBOM don't collide either.
+            occurrence_ref = f"{identity}#{project.org_id}/{project.project_id}#{occurrence_counts[identity]}"
+
             local_bom_ref = component.get("bom-ref")
             if local_bom_ref:
-                local_ref_map[local_bom_ref] = canonical_ref
+                local_ref_map[local_bom_ref] = occurrence_ref
+
             name, version = component.get("name"), component.get("version")
             if name and version:
-                component_lookup[(result.project.org_id, result.project.project_id, name, version)] = canonical_ref
-            _merge_component_into(merged_components, canonical_ref, component, result.project)
+                component_lookup[(project.org_id, project.project_id, name, version)].append(occurrence_ref)
+
+            occurrence = copy.deepcopy(component)
+            occurrence["bom-ref"] = occurrence_ref
+            occurrence["properties"] = list(occurrence.get("properties", [])) + [
+                {"name": "snyk:sourceProjectId", "value": f"{project.org_id}/{project.project_id}"}
+            ]
+            components.append(occurrence)
 
         for dependency in source_doc.get("dependencies") or []:
             ref = local_ref_map.get(dependency.get("ref"), dependency.get("ref"))
             if ref is None:
                 continue
             depends_on = {local_ref_map.get(d, d) for d in dependency.get("dependsOn") or []}
-            merged_edges[ref].update(depends_on)
+            dependency_edges[ref].update(depends_on)
 
-    components = [merged_components[key] for key in sorted(merged_components)]
+    # Sorted by bom-ref for NFR-2 idempotency (stable ordering across runs
+    # against unchanged input), not to collapse anything.
+    components.sort(key=lambda c: c["bom-ref"])
     dependencies = [
-        {"ref": ref, "dependsOn": sorted(deps)} for ref, deps in sorted(merged_edges.items())
+        {"ref": ref, "dependsOn": sorted(deps)} for ref, deps in sorted(dependency_edges.items())
     ]
 
     spec_version = format_match.group("spec_version")
@@ -291,7 +274,7 @@ def merge_sboms(fetch_results: List[SbomFetchResult], sbom_format: str) -> Merge
         # (they identify *this* BOM generation) and doesn't conflict with
         # NFR-2's idempotency goal, which is about component/dependency
         # *ordering* being stable so diffs stay meaningful -- both are sorted
-        # by canonical ref above for exactly that reason.
+        # by bom-ref above for exactly that reason.
         "serialNumber": f"urn:uuid:{uuid.uuid4()}",
         "version": 1,
         "metadata": {
@@ -305,7 +288,6 @@ def merge_sboms(fetch_results: List[SbomFetchResult], sbom_format: str) -> Merge
     return MergeResult(
         document=document,
         component_count=len(components),
-        raw_component_count=raw_component_count,
         dependency_count=len(dependencies),
-        component_lookup=component_lookup,
+        component_lookup=dict(component_lookup),
     )

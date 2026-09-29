@@ -62,7 +62,7 @@ reference. The most commonly used ones:
 | `--org`, `--target`, `--asset`, `--project`, `--group`, `--tag` | Source selection (repeatable, at least one required) |
 | `--token` | Snyk API token (overrides `$SNYK_TOKEN`) |
 | `--sbom-format` | SBOM format (default `cyclonedx1.6+json`); see note below |
-| `--output-prefix` | Filename stem for the two output files (default: `sbom`/`vex` in the current directory) |
+| `--output-prefix` | Filename stem for the output file(s) (default: `sbom` in the current directory for CycloneDX, `sbom`/`vex` for SPDX -- see below) |
 | `--no-vex` | Write the SBOM only, skip VEX generation |
 | `--fail-fast` | Abort on the first project-level failure instead of continuing |
 | `--debug` / `-v` | Verbose logging (HTTP requests, pagination, per-project status) |
@@ -72,20 +72,36 @@ reference. The most commonly used ones:
 For the resolved, de-duplicated set of projects:
 
 1. Fetches each in-scope (Open Source/Container) project's SBOM.
-2. Merges them into one aggregate CycloneDX document, de-duplicating
-   components by package URL and preserving the dependency graph.
+2. Aggregates them into one CycloneDX document, keeping every component
+   occurrence rather than de-duplicating by package URL: the same library
+   appearing in more than one project -- or more than once within a single
+   project -- appears that many times in the output, each occurrence with
+   its own `bom-ref` and a `snyk:sourceProjectId` property for traceability.
 3. Derives a CycloneDX VEX document from each project's vulnerability and
-   ignore data, cross-referenced to the aggregate SBOM.
-4. Writes both documents to disk.
+   ignore data. Unlike the SBOM, VEX content *is* de-duplicated: a
+   vulnerability affecting several component occurrences (the same flaw
+   surfaces as a separate issue in every project it's found in) collapses to
+   one vulnerability entry listing every affected occurrence in its
+   `affects` array, with a `snyk:occurrenceCount` property recording the
+   count. If the ignore/triage state differs across occurrences, the
+   least-suppressed state wins (open/unignored beats any ignored state) and
+   the run summary reports the conflict.
+4. Writes the output. Where VEX content lands depends on the SBOM format:
+   - **CycloneDX** (the default): SBOM and VEX are written to a single file,
+     e.g. `sbom.cdx.json` -- VEX is embedded directly in the aggregate SBOM
+     document.
+   - **SPDX**: written as two separate files, e.g. `sbom.spdx.json` and
+     `vex.cdx.json` -- a standalone CycloneDX VEX document cross-referenced
+     to the SPDX SBOM via a shared `serialNumber`, since SPDX has no
+     VEX-equivalent field.
 
-By default this produces `sbom.json` and `vex.json` in the current directory.
-With `--output-prefix myrun`, it produces `myrun.sbom.json` and
-`myrun.vex.json` instead.
+With `--output-prefix myrun`, the CycloneDX case produces `myrun.cdx.json`;
+the SPDX case produces `myrun.sbom.spdx.json` and `myrun.vex.cdx.json`.
 
-**Current limitation:** merging and VEX derivation are only implemented for
-the default CycloneDX+JSON format. Choosing an XML or SPDX `--sbom-format`
-still fetches per-project SBOMs, but the aggregate SBOM/VEX files are not
-produced for those formats (the run will say so).
+**Current limitation:** aggregation and VEX derivation are only implemented
+for the default CycloneDX+JSON format. Choosing an XML or SPDX
+`--sbom-format` still fetches per-project SBOMs, but the aggregate SBOM/VEX
+files are not produced for those formats (the run will say so).
 
 ## Running the tests
 
@@ -98,8 +114,13 @@ python3 -m unittest discover -s tests -t .
 This script is intended for production use, but be aware of the following
 before relying on it as your sole source of CRA compliance evidence:
 
-- Merging and VEX derivation only support the default CycloneDX+JSON format
-  (see the limitation noted above).
+- Aggregation and VEX derivation only support the default CycloneDX+JSON
+  format (see the limitation noted above).
+- VEX de-duplication (FR-9a) groups occurrences by CVE, falling back to
+  Snyk's own vulnerability key when no CVE is present. Whether that key is
+  reliably stable for "the same vulnerability" across different projects has
+  not been confirmed against the live Issues API -- see Open Risk #8 in the
+  requirements doc.
 - The `--asset` source depends on a Snyk endpoint
   (`/rest/orgs/{org}/inventory/assets`) that is not yet documented as GA at
   https://apidocs.snyk.io — reverify before relying on it long-term.

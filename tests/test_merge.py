@@ -23,7 +23,7 @@ def fetch_ok(org_id, project_id, doc):
 
 
 class MergeSbomsTests(unittest.TestCase):
-    def test_dedups_identical_purl_across_projects_and_unions_properties(self):
+    def test_keeps_every_duplicate_occurrence_across_projects(self):
         doc_a = {
             "metadata": {"component": {"bom-ref": "root", "type": "application", "name": "a", "purl": "pkg:app/a"}},
             "components": [{"bom-ref": "1-shared", "purl": "pkg:maven/shared@1.0", "name": "shared"}],
@@ -39,24 +39,52 @@ class MergeSbomsTests(unittest.TestCase):
         merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
 
         self.assertIsNone(merged.skipped_reason)
-        # 2 root components (pkg:app/a, pkg:app/b) + 1 shared purl collapsed from 2 -> 1
-        self.assertEqual(merged.component_count, 3)
-        self.assertEqual(merged.raw_component_count, 4)
+        # 2 root components (pkg:app/a, pkg:app/b) + 2 separate "shared" occurrences (FR-8: not collapsed)
+        self.assertEqual(merged.component_count, 4)
 
-        shared = next(c for c in merged.document["components"] if c["purl"] == "pkg:maven/shared@1.0")
-        prop_values = {p["value"] for p in shared["properties"] if p["name"] == "snyk:sourceProjectId"}
-        self.assertEqual(prop_values, {"org-1/p1", "org-1/p2"})
+        shared_occurrences = [c for c in merged.document["components"] if c["purl"] == "pkg:maven/shared@1.0"]
+        self.assertEqual(len(shared_occurrences), 2)
+        source_ids = {
+            p["value"]
+            for c in shared_occurrences
+            for p in c["properties"]
+            if p["name"] == "snyk:sourceProjectId"
+        }
+        self.assertEqual(source_ids, {"org-1/p1", "org-1/p2"})
+        # Each occurrence gets its own unique bom-ref (FR-8).
+        refs = {c["bom-ref"] for c in shared_occurrences}
+        self.assertEqual(len(refs), 2)
 
-    def test_component_lookup_maps_project_scoped_name_version_to_canonical_ref(self):
+    def test_keeps_every_duplicate_occurrence_within_a_single_project(self):
         doc = {
-            "components": [{"bom-ref": "1-x", "purl": "pkg:maven/shared@1.0", "name": "shared", "version": "1.0"}],
+            "components": [
+                {"bom-ref": "1-x", "purl": "pkg:maven/shared@1.0", "name": "shared", "version": "1.0"},
+                {"bom-ref": "2-x", "purl": "pkg:maven/shared@1.0", "name": "shared", "version": "1.0"},
+            ],
             "dependencies": [],
         }
         results = [fetch_ok("org-1", "p1", doc)]
         merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
-        self.assertEqual(merged.component_lookup[("org-1", "p1", "shared", "1.0")], "pkg:maven/shared@1.0")
 
-    def test_remaps_dependency_edges_across_documents(self):
+        self.assertEqual(merged.component_count, 2)
+        refs = [c["bom-ref"] for c in merged.document["components"]]
+        self.assertEqual(len(set(refs)), 2)  # unique despite identical identity+project
+
+    def test_component_lookup_maps_project_scoped_name_version_to_every_occurrence_ref(self):
+        doc = {
+            "components": [
+                {"bom-ref": "1-x", "purl": "pkg:maven/shared@1.0", "name": "shared", "version": "1.0"},
+                {"bom-ref": "2-x", "purl": "pkg:maven/shared@1.0", "name": "shared", "version": "1.0"},
+            ],
+            "dependencies": [],
+        }
+        results = [fetch_ok("org-1", "p1", doc)]
+        merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
+        refs = merged.component_lookup[("org-1", "p1", "shared", "1.0")]
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(set(refs), {c["bom-ref"] for c in merged.document["components"]})
+
+    def test_remaps_dependency_edges_within_each_project(self):
         # Both documents label their component "1-x", but they're different
         # purls -- a naive ref union would corrupt the graph if not remapped.
         doc_a = {
@@ -78,8 +106,14 @@ class MergeSbomsTests(unittest.TestCase):
         merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
 
         deps_by_ref = {d["ref"]: d["dependsOn"] for d in merged.document["dependencies"]}
-        self.assertEqual(deps_by_ref["pkg:maven/left@1.0"], ["pkg:maven/shared@1.0"])
-        self.assertEqual(deps_by_ref["pkg:maven/right@1.0"], ["pkg:maven/shared@1.0"])
+        left_ref = next(c["bom-ref"] for c in merged.document["components"] if c["purl"] == "pkg:maven/left@1.0")
+        right_ref = next(c["bom-ref"] for c in merged.document["components"] if c["purl"] == "pkg:maven/right@1.0")
+        self.assertEqual(len(deps_by_ref[left_ref]), 1)
+        self.assertEqual(len(deps_by_ref[right_ref]), 1)
+        # Each project's "shared" occurrence is distinct, and the edge points at its own project's occurrence.
+        left_dep_ref = next(iter(deps_by_ref[left_ref]))
+        right_dep_ref = next(iter(deps_by_ref[right_ref]))
+        self.assertNotEqual(left_dep_ref, right_dep_ref)
 
     def test_components_without_purl_fall_back_to_identity(self):
         doc = {
@@ -91,15 +125,9 @@ class MergeSbomsTests(unittest.TestCase):
         results = [fetch_ok("org-1", "p1", doc)]
         merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
         self.assertEqual(merged.component_count, 1)
-        self.assertEqual(merged.document["components"][0]["bom-ref"], "no-purl:container||img|1.0")
-
-    def test_unions_licenses_on_duplicate_component(self):
-        doc_a = {"components": [{"purl": "pkg:x@1", "licenses": [{"license": {"id": "MIT"}}]}], "dependencies": []}
-        doc_b = {"components": [{"purl": "pkg:x@1", "licenses": [{"license": {"id": "Apache-2.0"}}]}], "dependencies": []}
-        results = [fetch_ok("org-1", "p1", doc_a), fetch_ok("org-1", "p2", doc_b)]
-        merged = sbom.merge_sboms(results, "cyclonedx1.6+json")
-        licenses = merged.document["components"][0]["licenses"]
-        self.assertEqual(len(licenses), 2)
+        self.assertEqual(
+            merged.document["components"][0]["bom-ref"], "no-purl:container||img|1.0#org-1/p1#1"
+        )
 
     def test_skips_non_cyclonedx_json_format(self):
         results = [fetch_ok("org-1", "p1", {"components": []})]

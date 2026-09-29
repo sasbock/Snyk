@@ -171,7 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Enable verbose/debug logging: every HTTP request/response (token "
             "redacted), pagination progress, per-project status, source "
-            "resolution, and component de-duplication decisions."
+            "resolution, and VEX vulnerability de-duplication/conflict "
+            "decisions (FR-9a)."
         ),
     )
 

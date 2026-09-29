@@ -7,10 +7,13 @@ of its own -- only logging setup and top-level error-handling/exit-code
 logic (FR-14).
 
 This build implements the full pipeline: source resolution/discovery
-(FR-2, FR-2a, FR-6), per-project SBOM fetch (FR-7), merging into one
-aggregate CycloneDX document (FR-8, CycloneDX+JSON only), VEX derivation
-from each project's issue/ignore data (FR-9, CycloneDX+JSON only), and
-writing both to disk (FR-10).
+(FR-2, FR-2a, FR-6), per-project SBOM fetch (FR-7), aggregation into one
+CycloneDX document that keeps every duplicate component occurrence
+rather than de-duplicating by purl (FR-8, CycloneDX+JSON only), VEX
+derivation from each project's issue/ignore data that de-duplicates
+vulnerabilities across those occurrences via the affects array (FR-9,
+FR-9a, CycloneDX+JSON only), and writing the output -- one combined
+file for CycloneDX, or a separate SBOM/VEX file pair for SPDX (FR-10).
 """
 
 from __future__ import annotations
@@ -107,7 +110,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning(vex_result.skipped_reason)
     print(reporting.render_vex_summary(vex_result), flush=True)
 
-    write_result = writers.write_outputs(merge_result.document, vex_result.document, run_config.output_prefix)
+    write_result = writers.write_outputs(
+        merge_result.document, vex_result.document, run_config.sbom_format, run_config.output_prefix
+    )
     print(reporting.render_write_summary(write_result), flush=True)
 
     return 1 if fail_count else 0

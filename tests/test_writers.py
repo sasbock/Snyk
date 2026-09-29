@@ -16,32 +16,65 @@ class WriteOutputsTests(unittest.TestCase):
     def tearDown(self):
         os.chdir(self._cwd)
 
-    def test_default_names_are_sbom_and_vex_json_in_cwd(self):
-        result = writers.write_outputs({"a": 1}, {"b": 2}, output_prefix=None)
-        self.assertEqual(result.sbom_path, Path("sbom.json"))
-        self.assertEqual(result.vex_path, Path("vex.json"))
-        self.assertEqual(json.loads(Path("sbom.json").read_text()), {"a": 1})
-        self.assertEqual(json.loads(Path("vex.json").read_text()), {"b": 2})
+    # -- CycloneDX: one merged file (FR-10) ----------------------------------
 
-    def test_output_prefix_is_used_as_filename_stem(self):
-        result = writers.write_outputs({"a": 1}, {"b": 2}, output_prefix="myrun")
-        self.assertEqual(result.sbom_path, Path("myrun.sbom.json"))
-        self.assertEqual(result.vex_path, Path("myrun.vex.json"))
+    def test_cyclonedx_writes_one_file_with_vex_embedded(self):
+        sbom_doc = {"bomFormat": "CycloneDX", "components": []}
+        vex_doc = {"bomFormat": "CycloneDX", "vulnerabilities": [{"id": "CVE-2020-0001"}]}
+        result = writers.write_outputs(sbom_doc, vex_doc, "cyclonedx1.6+json", output_prefix=None)
+
+        self.assertEqual(result.sbom_path, Path("sbom.cdx.json"))
+        self.assertIsNone(result.vex_path)
+        self.assertTrue(result.vex_embedded)
+
+        written = json.loads(Path("sbom.cdx.json").read_text())
+        self.assertEqual(written["components"], [])
+        self.assertEqual(written["vulnerabilities"], [{"id": "CVE-2020-0001"}])
+
+    def test_cyclonedx_output_prefix_replaces_default_basename(self):
+        result = writers.write_outputs({"components": []}, None, "cyclonedx1.6+json", output_prefix="myrun")
+        self.assertEqual(result.sbom_path, Path("myrun.cdx.json"))
+        self.assertTrue(result.sbom_path.exists())
+
+    def test_cyclonedx_without_vex_writes_sbom_only(self):
+        result = writers.write_outputs({"components": []}, None, "cyclonedx1.6+json", output_prefix=None)
+        self.assertEqual(result.sbom_path, Path("sbom.cdx.json"))
+        self.assertIsNone(result.vex_path)
+        self.assertFalse(result.vex_embedded)
+
+    # -- SPDX: two separate files (FR-10) ------------------------------------
+
+    def test_spdx_writes_two_separate_files(self):
+        sbom_doc = {"spdxVersion": "SPDX-2.3"}
+        vex_doc = {"bomFormat": "CycloneDX", "vulnerabilities": []}
+        result = writers.write_outputs(sbom_doc, vex_doc, "spdx2.3+json", output_prefix=None)
+
+        self.assertEqual(result.sbom_path, Path("sbom.spdx.json"))
+        self.assertEqual(result.vex_path, Path("vex.cdx.json"))
+        self.assertFalse(result.vex_embedded)
+        self.assertEqual(json.loads(Path("sbom.spdx.json").read_text()), sbom_doc)
+        self.assertEqual(json.loads(Path("vex.cdx.json").read_text()), vex_doc)
+
+    def test_spdx_output_prefix_is_used_as_filename_stem_for_both_files(self):
+        result = writers.write_outputs({"a": 1}, {"b": 2}, "spdx2.3+json", output_prefix="myrun")
+        self.assertEqual(result.sbom_path, Path("myrun.sbom.spdx.json"))
+        self.assertEqual(result.vex_path, Path("myrun.vex.cdx.json"))
         self.assertTrue(result.sbom_path.exists())
         self.assertTrue(result.vex_path.exists())
 
-    def test_none_document_is_not_written(self):
-        result = writers.write_outputs(None, None, output_prefix=None)
-        self.assertIsNone(result.sbom_path)
-        self.assertIsNone(result.vex_path)
-        self.assertFalse(Path("sbom.json").exists())
-        self.assertFalse(Path("vex.json").exists())
-
-    def test_writes_only_sbom_when_vex_is_none(self):
-        result = writers.write_outputs({"a": 1}, None, output_prefix=None)
+    def test_spdx_without_vex_writes_sbom_only(self):
+        result = writers.write_outputs({"a": 1}, None, "spdx2.3+json", output_prefix=None)
         self.assertIsNotNone(result.sbom_path)
         self.assertIsNone(result.vex_path)
-        self.assertFalse(Path("vex.json").exists())
+        self.assertFalse(Path("vex.cdx.json").exists())
+
+    # -- shared behavior ------------------------------------------------------
+
+    def test_none_sbom_document_writes_nothing(self):
+        result = writers.write_outputs(None, {"b": 2}, "cyclonedx1.6+json", output_prefix=None)
+        self.assertIsNone(result.sbom_path)
+        self.assertIsNone(result.vex_path)
+        self.assertFalse(Path("sbom.cdx.json").exists())
 
 
 if __name__ == "__main__":

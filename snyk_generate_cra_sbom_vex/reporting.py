@@ -5,8 +5,7 @@ This module owns presentation only; writers.py does the actual file I/O.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from .resolvers.base import ResolvedProject
 from .sbom import MergeResult, SbomFetchResult
@@ -69,11 +68,9 @@ def render_sbom_fetch_table(results: List[SbomFetchResult]) -> str:
 def render_merge_summary(result: MergeResult) -> str:
     if result.skipped_reason:
         return f"Merge skipped: {result.skipped_reason}"
-    duplicates_collapsed = result.raw_component_count - result.component_count
     return (
-        f"Merged {result.component_count} unique component(s) "
-        f"({result.raw_component_count} raw across all fetched SBOMs, "
-        f"{duplicates_collapsed} duplicate(s) collapsed by purl/identity), "
+        f"Aggregated {result.component_count} component occurrence(s) across all fetched "
+        f"SBOMs (no de-duplication -- every occurrence is kept per FR-8), "
         f"{result.dependency_count} dependency edge(s). "
         f"serialNumber={result.document['serialNumber']}"
     )
@@ -86,13 +83,23 @@ def render_vex_summary(result: VexBuildResult) -> str:
     if result.needs_manual_justification:
         warnings.append(f"{result.needs_manual_justification} need manual justification (FR-4)")
     if result.unmatched_count:
-        warnings.append(f"{result.unmatched_count} could not be matched to a merged SBOM component")
+        warnings.append(f"{result.unmatched_count} could not be matched to an aggregate SBOM component")
+    if result.conflicting_state_count:
+        warnings.append(
+            f"{result.conflicting_state_count} had conflicting per-occurrence states collapsed (FR-9a)"
+        )
     suffix = f" ({'; '.join(warnings)})" if warnings else ""
-    return f"Derived {result.vulnerability_count} VEX entry(ies){suffix}."
+    return f"Derived {result.vulnerability_count} unique VEX entry(ies) (de-duplicated across occurrences, FR-9a){suffix}."
 
 
 def render_write_summary(result: WriteResult) -> str:
-    def describe(label: str, path: Optional[Path]) -> str:
-        return f"{label}: {path}" if path is not None else f"{label}: (not written -- nothing to write)"
-
-    return "\n".join([describe("SBOM", result.sbom_path), describe("VEX", result.vex_path)])
+    sbom_line = (
+        f"SBOM: {result.sbom_path}" if result.sbom_path is not None else "SBOM: (not written -- nothing to write)"
+    )
+    if result.vex_embedded:
+        vex_line = f"VEX: embedded in SBOM file ({result.sbom_path})"
+    elif result.vex_path is not None:
+        vex_line = f"VEX: {result.vex_path}"
+    else:
+        vex_line = "VEX: (not written -- nothing to write)"
+    return "\n".join([sbom_line, vex_line])

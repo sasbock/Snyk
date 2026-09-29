@@ -13,16 +13,32 @@ table is written against -- so this module reads the vulnerability list
 from the REST API and ignore reasons from the legacy v1 API.
 
 VEX entries are cross-referenced to the aggregate SBOM via
-MergeResult.component_lookup (built while merging, from the same
+MergeResult.component_lookup (built while aggregating, from the same
 project-scoped package name/version each issue's `coordinates` report),
 so VEX can only be derived once an aggregate SBOM exists (FR-3: "only
-CycloneDX+JSON" merges have one).
+CycloneDX+JSON" aggregates have one).
+
+Per FR-9a (v0.6), a vulnerability that affects more than one component
+occurrence -- because the same underlying vulnerability surfaces as a
+distinct per-project issue in every project a package appears in, and/or
+FR-8 now keeps every duplicate occurrence rather than collapsing them --
+is de-duplicated to exactly one vulnerability entry, listing every
+affected occurrence in its `affects` array and an `snyk:occurrenceCount`
+property. Grouping is keyed on the underlying vulnerability identifier
+(CVE, or the Snyk vulnerability key as a fallback -- see
+_preferred_vuln_id), never the per-project issue ID, since the issue ID
+differs project to project for the same flaw (Open Risk #8). If the
+resolved per-occurrence analysis states disagree (e.g. ignored in one
+project but not another), the least-suppressed state wins (open/
+unignored beats any ignored state) and the conflict is reported back to
+the caller.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,14 +64,33 @@ _VALID_JUSTIFICATION_CODES = {
 }
 _NON_ALNUM_RE = re.compile(r"[\s\-]+")
 
+# FR-9a's "least-suppressed state" ordering: lower rank wins a conflict.
+# Plain open/unignored is least suppressed; a wont-fix override is still
+# CycloneDX state "exploitable" but is nonetheless a suppression decision,
+# so it ranks just below plain-open; not_affected is the most suppressed.
+_RANK_OPEN = 0
+_RANK_WONT_FIX = 1
+_RANK_IN_TRIAGE = 2
+_RANK_NOT_AFFECTED = 3
+_RANK_OTHER = 4
+
 
 @dataclass(frozen=True)
 class VexBuildResult:
     document: Optional[Dict[str, Any]]
-    vulnerability_count: int
+    vulnerability_count: int  # unique vulnerabilities after FR-9a de-duplication
     needs_manual_justification: int  # FR-4: ignores flagged for manual review rather than guessed
-    unmatched_count: int  # issues that couldn't be linked to a merged SBOM component
+    unmatched_count: int  # issues that couldn't be linked to an aggregate SBOM component
+    conflicting_state_count: int  # FR-9a: vulnerabilities whose per-occurrence states disagreed
     skipped_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _Occurrence:
+    component_ref: str
+    analysis: Dict[str, Any]
+    org_id: str
+    project_id: str
 
 
 def _normalize_justification_code(reason_text: str) -> Optional[str]:
@@ -128,21 +163,33 @@ def _build_analysis(ignore_details: Optional[Dict[str, Any]]) -> Tuple[Dict[str,
     return {"state": "in_triage"}, True
 
 
-def _match_component_ref(
+def _suppression_rank(analysis: Dict[str, Any]) -> int:
+    """FR-9a's least-suppressed-state ordering; lower wins a conflict."""
+    state = analysis.get("state")
+    if state == "exploitable":
+        return _RANK_WONT_FIX if "will_not_fix" in (analysis.get("response") or []) else _RANK_OPEN
+    if state == "in_triage":
+        return _RANK_IN_TRIAGE
+    if state == "not_affected":
+        return _RANK_NOT_AFFECTED
+    return _RANK_OTHER
+
+
+def _match_component_refs(
     issue_attrs: Dict[str, Any],
-    component_lookup: Dict[Tuple[str, str, str, str], str],
+    component_lookup: Dict[Tuple[str, str, str, str], List[str]],
     org_id: str,
     project_id: str,
-) -> Optional[str]:
+) -> List[str]:
     for coordinate in issue_attrs.get("coordinates") or []:
         for representation in coordinate.get("representations") or []:
             dependency = representation.get("dependency") or {}
             name, version = dependency.get("package_name"), dependency.get("package_version")
             if name and version:
-                ref = component_lookup.get((org_id, project_id, name, version))
-                if ref:
-                    return ref
-    return None
+                refs = component_lookup.get((org_id, project_id, name, version))
+                if refs:
+                    return refs
+    return []
 
 
 def derive_vex(
@@ -153,11 +200,14 @@ def derive_vex(
 ) -> VexBuildResult:
     """Builds the aggregate VEX document from every successfully fetched project's issues.
 
-    Raises nothing project-specific: an issue that can't be matched to a
-    merged component, or an ignore lacking a recognized justification, is
-    counted and reported rather than treated as a fatal error (FR-14's
+    Raises nothing project-specific: an issue that can't be matched to an
+    aggregate component, or an ignore lacking a recognized justification,
+    is counted and reported rather than treated as a fatal error (FR-14's
     "continue past a single project's failure" spirit extended to
-    per-issue anomalies).
+    per-issue anomalies). Per FR-9a, occurrences of the same underlying
+    vulnerability (by vuln ID, across projects and across duplicate
+    component occurrences within a project) are grouped into one
+    vulnerability entry before the document is built.
     """
     if not generate_vex:
         return VexBuildResult(
@@ -165,6 +215,7 @@ def derive_vex(
             vulnerability_count=0,
             needs_manual_justification=0,
             unmatched_count=0,
+            conflicting_state_count=0,
             skipped_reason="VEX generation disabled (--no-vex, or --sbom-format is not CycloneDX+JSON)",
         )
 
@@ -174,13 +225,14 @@ def derive_vex(
             vulnerability_count=0,
             needs_manual_justification=0,
             unmatched_count=0,
+            conflicting_state_count=0,
             skipped_reason=(
-                "no aggregate SBOM to cross-reference (merge was skipped: "
+                "no aggregate SBOM to cross-reference (aggregation was skipped: "
                 f"{merge_result.skipped_reason})"
             ),
         )
 
-    vulnerabilities: List[Dict[str, Any]] = []
+    occurrences_by_vuln: Dict[str, List[_Occurrence]] = defaultdict(list)
     needs_manual = 0
     unmatched = 0
 
@@ -196,11 +248,11 @@ def derive_vex(
             if attrs.get("type") != "package_vulnerability":
                 continue  # license/config/code findings aren't SBOM components (FR-1's scope, extended)
 
-            component_ref = _match_component_ref(attrs, merge_result.component_lookup, project.org_id, project.project_id)
-            if component_ref is None:
+            component_refs = _match_component_refs(attrs, merge_result.component_lookup, project.org_id, project.project_id)
+            if not component_refs:
                 unmatched += 1
                 logger.debug(
-                    "could not match issue %s in %s/%s to a merged SBOM component; skipped",
+                    "could not match issue %s in %s/%s to an aggregate SBOM component; skipped",
                     attrs.get("key"),
                     project.org_id,
                     project.project_id,
@@ -220,16 +272,44 @@ def derive_vex(
                     project.project_id,
                 )
 
-            vulnerabilities.append(
-                {
-                    "bom-ref": f"vuln-{issue.get('id')}",
-                    "id": _preferred_vuln_id(attrs),
-                    "affects": [{"ref": component_ref}],
-                    "analysis": analysis,
-                }
-            )
+            vuln_id = _preferred_vuln_id(attrs)
+            for component_ref in component_refs:
+                occurrences_by_vuln[vuln_id].append(
+                    _Occurrence(
+                        component_ref=component_ref,
+                        analysis=analysis,
+                        org_id=project.org_id,
+                        project_id=project.project_id,
+                    )
+                )
 
-    vulnerabilities.sort(key=lambda v: (v["id"], v["affects"][0]["ref"]))
+    vulnerabilities: List[Dict[str, Any]] = []
+    conflicting_states = 0
+
+    for vuln_id in sorted(occurrences_by_vuln):
+        occurrences = occurrences_by_vuln[vuln_id]
+        affects = sorted({o.component_ref for o in occurrences})
+
+        ranks = {_suppression_rank(o.analysis) for o in occurrences}
+        if len(ranks) > 1:
+            conflicting_states += 1
+            logger.warning(
+                "conflicting per-occurrence VEX state collapsed for %s across %d occurrence(s): "
+                "resolved to the least-suppressed state (FR-9a)",
+                vuln_id,
+                len(occurrences),
+            )
+        winning_analysis = min(occurrences, key=lambda o: _suppression_rank(o.analysis)).analysis
+
+        vulnerabilities.append(
+            {
+                "bom-ref": f"vuln-{vuln_id}",
+                "id": vuln_id,
+                "affects": [{"ref": ref} for ref in affects],
+                "analysis": winning_analysis,
+                "properties": [{"name": "snyk:occurrenceCount", "value": str(len(affects))}],
+            }
+        )
 
     document = {
         "bomFormat": "CycloneDX",
@@ -246,4 +326,5 @@ def derive_vex(
         vulnerability_count=len(vulnerabilities),
         needs_manual_justification=needs_manual,
         unmatched_count=unmatched,
+        conflicting_state_count=conflicting_states,
     )

@@ -27,6 +27,23 @@ def build_merge(org_id, project_id, package_name, package_version, purl):
     return fetch_result, merge_result
 
 
+def build_merge_multi(entries):
+    """entries: [(org_id, project_id, package_name, package_version, purl), ...]"""
+    fetch_results = []
+    for org_id, project_id, package_name, package_version, purl in entries:
+        doc = {
+            "components": [
+                {"bom-ref": "1-x", "purl": purl, "name": package_name, "version": package_version}
+            ],
+            "dependencies": [],
+        }
+        fetch_results.append(
+            sbom.SbomFetchResult(project=resolved(org_id, project_id), ok=True, document=json.dumps(doc).encode())
+        )
+    merge_result = sbom.merge_sboms(fetch_results, "cyclonedx1.6+json")
+    return fetch_results, merge_result
+
+
 class BuildAnalysisTests(unittest.TestCase):
     def test_open_unignored_is_exploitable(self):
         analysis, needs_review = vex._build_analysis(None)
@@ -93,8 +110,11 @@ class DeriveVexTests(unittest.TestCase):
         self.assertEqual(result.vulnerability_count, 1)
         v = result.document["vulnerabilities"][0]
         self.assertEqual(v["id"], "CVE-2020-0001")
-        self.assertEqual(v["affects"], [{"ref": "pkg:maven/shared@1.0"}])
+        component_ref = merge_result.component_lookup[("org-1", "p1", "shared", "1.0")][0]
+        self.assertEqual(v["affects"], [{"ref": component_ref}])
         self.assertEqual(v["analysis"], {"state": "exploitable"})
+        occurrence_count = next(p["value"] for p in v["properties"] if p["name"] == "snyk:occurrenceCount")
+        self.assertEqual(occurrence_count, "1")
 
     def test_falls_back_to_snyk_key_when_no_cve(self):
         fetch_result, merge_result = build_merge("org-1", "p1", "shared", "1.0", "pkg:maven/shared@1.0")
@@ -164,7 +184,7 @@ class DeriveVexTests(unittest.TestCase):
         client = FakeSnykClient()
         result = vex.derive_vex(client, [fetch_result], empty_merge, generate_vex=True)
         self.assertIsNone(result.document)
-        self.assertIn("merge was skipped", result.skipped_reason)
+        self.assertIn("aggregation was skipped", result.skipped_reason)
 
     def test_output_ordering_is_deterministic(self):
         fetch_result, merge_result = build_merge("org-1", "p1", "shared", "1.0", "pkg:maven/shared@1.0")
@@ -185,6 +205,74 @@ class DeriveVexTests(unittest.TestCase):
         client = FakeSnykClient(project_issues={("org-1", "p1"): [issue("i1", "SNYK-1", "shared", "1.0")]})
         result = vex.derive_vex(client, [fetch_result], merge_result, generate_vex=True)
         self.assertEqual(result.document["serialNumber"], merge_result.document["serialNumber"])
+
+    def test_dedups_same_vulnerability_across_project_occurrences_via_affects_array(self):
+        # FR-9a: the same underlying vulnerability (by CVE) surfaces as a
+        # distinct per-project issue ID in each project -- it must still
+        # collapse to one vulnerability entry listing every occurrence.
+        fetch_results, merge_result = build_merge_multi(
+            [
+                ("org-1", "p1", "shared", "1.0", "pkg:maven/shared@1.0"),
+                ("org-2", "p2", "shared", "1.0", "pkg:maven/shared@1.0"),
+            ]
+        )
+        client = FakeSnykClient(
+            project_issues={
+                ("org-1", "p1"): [issue("i1", "SNYK-1", "shared", "1.0", cve="CVE-2020-0001")],
+                ("org-2", "p2"): [issue("i2", "SNYK-2", "shared", "1.0", cve="CVE-2020-0001")],
+            },
+        )
+        result = vex.derive_vex(client, fetch_results, merge_result, generate_vex=True)
+
+        self.assertEqual(result.vulnerability_count, 1)
+        v = result.document["vulnerabilities"][0]
+        self.assertEqual(v["id"], "CVE-2020-0001")
+        self.assertEqual(len(v["affects"]), 2)
+        occurrence_count = next(p["value"] for p in v["properties"] if p["name"] == "snyk:occurrenceCount")
+        self.assertEqual(occurrence_count, "2")
+        self.assertEqual(result.conflicting_state_count, 0)
+
+    def test_conflicting_states_resolve_to_least_suppressed_and_are_flagged(self):
+        # Open/unignored in one project, ignored (not-vulnerable) in another:
+        # the least-suppressed state (exploitable) must win, and the
+        # conflict must be reported (FR-9a).
+        fetch_results, merge_result = build_merge_multi(
+            [
+                ("org-1", "p1", "shared", "1.0", "pkg:maven/shared@1.0"),
+                ("org-2", "p2", "shared", "1.0", "pkg:maven/shared@1.0"),
+            ]
+        )
+        client = FakeSnykClient(
+            project_issues={
+                ("org-1", "p1"): [issue("i1", "SNYK-1", "shared", "1.0", cve="CVE-2020-0001")],
+                ("org-2", "p2"): [issue("i2", "SNYK-1", "shared", "1.0", cve="CVE-2020-0001")],
+            },
+            project_ignores={
+                ("org-2", "p2"): {"SNYK-1": ignore_entry("not-vulnerable", "code not present")},
+            },
+        )
+        result = vex.derive_vex(client, fetch_results, merge_result, generate_vex=True)
+
+        self.assertEqual(result.vulnerability_count, 1)
+        v = result.document["vulnerabilities"][0]
+        self.assertEqual(v["analysis"], {"state": "exploitable"})
+        self.assertEqual(result.conflicting_state_count, 1)
+
+    def test_no_conflict_when_all_occurrences_agree(self):
+        fetch_results, merge_result = build_merge_multi(
+            [
+                ("org-1", "p1", "shared", "1.0", "pkg:maven/shared@1.0"),
+                ("org-2", "p2", "shared", "1.0", "pkg:maven/shared@1.0"),
+            ]
+        )
+        client = FakeSnykClient(
+            project_issues={
+                ("org-1", "p1"): [issue("i1", "SNYK-1", "shared", "1.0", cve="CVE-2020-0001")],
+                ("org-2", "p2"): [issue("i2", "SNYK-1", "shared", "1.0", cve="CVE-2020-0001")],
+            },
+        )
+        result = vex.derive_vex(client, fetch_results, merge_result, generate_vex=True)
+        self.assertEqual(result.conflicting_state_count, 0)
 
 
 if __name__ == "__main__":
